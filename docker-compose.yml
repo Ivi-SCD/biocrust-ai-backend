@@ -1,0 +1,167 @@
+version: '3.8'
+
+services:
+  # =========================================================================
+  # API FastAPI
+  # =========================================================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: biofouling_api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/biofouling
+      - DATABASE_SYNC_URL=postgresql://postgres:postgres@db:5432/biofouling
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - SECRET_KEY=super-secret-key-change-in-production-2024
+      - DEBUG=false
+      - ENVIRONMENT=development
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./app:/app/app
+      - reports_data:/tmp/reports
+    networks:
+      - biofouling_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # =========================================================================
+  # PostgreSQL com TimescaleDB
+  # =========================================================================
+  db:
+    image: timescale/timescaledb:latest-pg15
+    container_name: biofouling_db
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=biofouling
+    ports:
+      - "5433:5432"  # Porta 5433 externa para evitar conflito com PostgreSQL local
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - biofouling_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =========================================================================
+  # Redis
+  # =========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: biofouling_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - biofouling_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =========================================================================
+  # Celery Worker
+  # =========================================================================
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: biofouling_celery_worker
+    command: celery -A app.tasks worker --loglevel=info --concurrency=4
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/biofouling
+      - DATABASE_SYNC_URL=postgresql://postgres:postgres@db:5432/biofouling
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      - redis
+      - db
+    volumes:
+      - ./app:/app/app
+      - reports_data:/tmp/reports
+    networks:
+      - biofouling_network
+    restart: unless-stopped
+
+  # =========================================================================
+  # Celery Beat (Scheduler)
+  # =========================================================================
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: biofouling_celery_beat
+    command: celery -A app.tasks beat --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/biofouling
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      - redis
+      - celery_worker
+    volumes:
+      - ./app:/app/app
+    networks:
+      - biofouling_network
+    restart: unless-stopped
+
+  # =========================================================================
+  # Flower (Celery Monitor)
+  # =========================================================================
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: biofouling_flower
+    command: celery -A app.tasks flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      - redis
+      - celery_worker
+    networks:
+      - biofouling_network
+    restart: unless-stopped
+
+# =========================================================================
+# Volumes
+# =========================================================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  reports_data:
+    driver: local
+
+# =========================================================================
+# Networks
+# =========================================================================
+networks:
+  biofouling_network:
+    driver: bridge
